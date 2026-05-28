@@ -13,12 +13,10 @@ local ADVANCED_WEAPON_PATHS = {
 		"/Game/Gameplay/ItemsLogic/Weapon/Wpn_TwoHand/Musket_Sniper_Advanced/RangeWpn/DA_RangeWpn_Musket_Sniper_Advanced_LogicParams.DA_RangeWpn_Musket_Sniper_Advanced_LogicParams",
 }
 
--- Keep track of already modified weapons to prevent double-buffing due to ClientRestart in the lobby AND when map is loaded 
-local PROCESSED_WEAPONS = {}
+-- Cache vanilla clip sizes to safely scale weapons regardless of how often the script runs
+local VANILLA_CLIP_SIZES = {}
 
--- Initialize the modification for the chosen weapons to support MultiShot
-local function ModifyWeaponAbilities()
-    -- Pre-load the multi-shot class once
+local function GetMultiShotClass()
     local MultiShotPath = "/Game/Gameplay/Character/Common/GameplayAbilities/RangeWeapon/MultiShotAbility/GA_RangeWeapon_MultiShot.GA_RangeWeapon_MultiShot_C"
     local MultiShotClass = StaticFindObject(MultiShotPath)
     if not MultiShotClass or not MultiShotClass:IsValid() then
@@ -30,63 +28,129 @@ local function ModifyWeaponAbilities()
     
     if not MultiShotClass then
         print("[Mod] Error: Could not load MultiShotClass.")
-        return
+        return nil
     end
+    return MultiShotClass
+end
+
+local function ApplyMultiShotToWeapon(WeaponLogicParams, WeaponLogicPath, MultiShotClass)
+    local currentClipSize = WeaponLogicParams.CommonData.MaxClipSize
+    
+    -- Memorize the vanilla clip size the very first time we see this weapon
+    if not VANILLA_CLIP_SIZES[WeaponLogicPath] then
+        VANILLA_CLIP_SIZES[WeaponLogicPath] = currentClipSize
+    end
+    
+    local vanillaSize = VANILLA_CLIP_SIZES[WeaponLogicPath]
+    local targetSize = 2
+
+    if vanillaSize == 1 then
+        targetSize = 2
+    elseif vanillaSize == 2 then
+        targetSize = 3
+    elseif vanillaSize >= 3 then
+        targetSize = 5
+    end
+    
+    -- 1. Idempotent assignment
+    WeaponLogicParams.CommonData.MaxClipSize = targetSize
+    
+    local AbilitiesArray = WeaponLogicParams.R5EquipmentItemLogicData.GrantedAbilities
+    local swappedAbility = false
+    
+    -- 2. Swap the standard shot ability with the multi-shot ability
+    if AbilitiesArray then
+        for i = 1, #AbilitiesArray do
+            local Ability = AbilitiesArray[i]
+            
+            if Ability then
+                local ok, abilityName = pcall(function() return Ability:GetFName():ToString() end)
+                if ok and abilityName and string.find(abilityName, "GA_RangeWeapon_Shot") and not string.find(abilityName, "MultiShot") then
+                    AbilitiesArray[i] = MultiShotClass
+                    swappedAbility = true
+                end
+            end
+        end
+    end
+    
+    if swappedAbility then
+        print(string.format("[Mod] Multi-shot config applied to: %s (Clip: %d -> %d)", WeaponLogicParams:GetFName():ToString(), vanillaSize, targetSize))
+    end
+end
+
+-- Initialize the modification for the chosen weapons to support MultiShot
+local function ModifyWeaponAbilities()
+    local MultiShotClass = GetMultiShotClass()
+    if not MultiShotClass then return end
 
     -- Iterate over all defined advanced weapons
     for _, WeaponLogicPath in ipairs(ADVANCED_WEAPON_PATHS) do
-        -- Only process each weapon once per session
-        if not PROCESSED_WEAPONS[WeaponLogicPath] then
-            local WeaponLogicParams = FindObject("R5RangeWeaponItemLogicParams", WeaponLogicPath)
-            
-            -- If the object is not loaded in memory yet, force the engine to load it
-            if not WeaponLogicParams or not WeaponLogicParams:IsValid() then
-                local ok, loaded = pcall(function()
-                    return LoadAsset(WeaponLogicPath)
-                end)
-                if ok then WeaponLogicParams = loaded end
-            end
-
-            if WeaponLogicParams and WeaponLogicParams:IsValid() then
-                -- 1. Increase clip size based on current value for a proper upgrade path
-                local currentClipSize = WeaponLogicParams.CommonData.MaxClipSize
-                
-                if currentClipSize == 1 then
-                    WeaponLogicParams.CommonData.MaxClipSize = 2
-                elseif currentClipSize == 2 then
-                    WeaponLogicParams.CommonData.MaxClipSize = 3
-                elseif currentClipSize >= 3 then
-                    WeaponLogicParams.CommonData.MaxClipSize = 5
-                end
-                
-                -- 2. Swap the standard shot ability with the multi-shot ability
-                local AbilitiesArray = WeaponLogicParams.R5EquipmentItemLogicData.GrantedAbilities
-                
-                if AbilitiesArray then
-                    for i = 1, #AbilitiesArray do
-                        local Ability = AbilitiesArray[i]
-                        
-                        -- Safely check the ability name to avoid TSet value errors
-                        if Ability then
-                            local ok, abilityName = pcall(function() return Ability:GetFName():ToString() end)
-                            if ok and abilityName and string.find(abilityName, "GA_RangeWeapon_Shot") then
-                                -- Replace the single shot with the multi-shot class
-                                AbilitiesArray[i] = MultiShotClass
-                            end
+        local WeaponLogicParams = StaticFindObject(WeaponLogicPath)
+        
+        -- If the object is not loaded in memory yet, force the engine to load it
+        if not WeaponLogicParams or not WeaponLogicParams:IsValid() then
+            local ok, loaded = pcall(function()
+                return LoadAsset(WeaponLogicPath)
+            end)
+            if ok then WeaponLogicParams = loaded end
+        end
+        
+        -- Bulletproof fallback: Grab directly from memory if UE4SS failed to link the path natively
+        if not WeaponLogicParams or not WeaponLogicParams:IsValid() then
+            local allParams = FindAllOf("R5RangeWeaponItemLogicParams")
+            if allParams then
+                for i = 1, #allParams do
+                    local paramObj = allParams[i]
+                    if paramObj and paramObj:IsValid() then
+                        local ok, paramName = pcall(function() return paramObj:GetFullName() end)
+                        if ok and paramName and string.find(paramName, WeaponLogicPath, 1, true) then
+                            WeaponLogicParams = paramObj
+                            break    
                         end
                     end
                 end
-                
-                print(string.format("[Mod] Multi-shot configuration applied to: %s", WeaponLogicParams:GetFName():ToString()))
-                PROCESSED_WEAPONS[WeaponLogicPath] = true
-            else
-                print(string.format("[Mod] Error: Could not locate logic params at %s", WeaponLogicPath))
             end
+        end
+        
+        if WeaponLogicParams and WeaponLogicParams:IsValid() then
+            ApplyMultiShotToWeapon(WeaponLogicParams, WeaponLogicPath, MultiShotClass)
+        else
+            print(string.format("[Mod] Error: Could not locate logic params at %s", WeaponLogicPath))
         end
     end
 end
 
--- Hook into an early game event (like player restart) to ensure data assets are loaded
-RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(Context)
-    ModifyWeaponAbilities()
+-- Keep references to hooks so Lua's Garbage Collector doesn't unregister them during map loads
+local PersistentHooks = {}
+
+-- Hook 1: Early game event (Base check for singleplayer / clients)
+PersistentHooks.ClientRestartPre, PersistentHooks.ClientRestartPost = RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(Context)
+    -- Multiplayer timing fix: Delay execution to give the server time to load the assets
+    if type(ExecuteWithDelay) == "function" and type(ExecuteInGameThread) == "function" then
+        ExecuteWithDelay(2500, function()
+            ExecuteInGameThread(function() ModifyWeaponAbilities() end)
+        end)
+    end
+end)
+
+-- Hook 2: The ultimate Multiplayer Sentinel. Wakes up the exact millisecond the server streams a weapon into RAM.
+NotifyOnNewObject("/Script/R5.R5RangeWeaponItemLogicParams", function(CreatedObject)
+    if CreatedObject and CreatedObject:IsValid() then
+        local ok, objName = pcall(function() return CreatedObject:GetFullName() end)
+        if ok and objName then
+            for _, path in ipairs(ADVANCED_WEAPON_PATHS) do
+                if string.find(objName, path, 1, true) then
+                    if type(ExecuteInGameThread) == "function" then
+                        ExecuteInGameThread(function()
+                            local MultiShotClass = GetMultiShotClass()
+                            if MultiShotClass then
+                                ApplyMultiShotToWeapon(CreatedObject, path, MultiShotClass)
+                            end
+                        end)
+                    end
+                    break
+                end
+            end
+        end
+    end
 end)
